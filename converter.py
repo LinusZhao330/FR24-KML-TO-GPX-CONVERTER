@@ -673,8 +673,96 @@ def run_gui() -> bool:
             style.configure("InfoLabel.TLabel", background="#eef2ff", foreground="#475569", font=("Segoe UI", 9))
 
         def _build_ui(self) -> None:
-            main = self.ttk.Frame(self.root, padding=(24, 22, 24, 22), style="App.TFrame")
-            main.pack(fill="both", expand=True)
+            self.root.rowconfigure(0, weight=1)
+            self.root.columnconfigure(0, weight=1)
+
+            container = self.ttk.Frame(self.root, style="App.TFrame")
+            container.grid(row=0, column=0, sticky="nsew")
+            container.columnconfigure(0, weight=1)
+            container.rowconfigure(0, weight=1)
+
+            canvas = self.tk.Canvas(container, highlightthickness=0, bg="#f5f7fb")
+            vscroll = self.ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=vscroll.set)
+
+            canvas.grid(row=0, column=0, sticky="nsew")
+            vscroll.grid(row=0, column=1, sticky="ns")
+
+            main = self.ttk.Frame(canvas, padding=(24, 22, 24, 22), style="App.TFrame")
+            canvas_window = canvas.create_window((0, 0), window=main, anchor="nw")
+
+            self._scroll_container = container
+            self._scroll_canvas = canvas
+            self._scrollbar = vscroll
+            self._scroll_window = canvas_window
+
+            def _update_scroll_region(_: object) -> None:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+
+            def _sync_frame_width(event: object) -> None:
+                canvas.itemconfigure(canvas_window, width=canvas.winfo_width())
+
+            def _is_descendant(widget: object, ancestor: object) -> bool:
+                if not widget or not ancestor:
+                    return False
+                try:
+                    current = widget
+                    while current is not None:
+                        if current is ancestor:
+                            return True
+                        parent_name = current.winfo_parent()
+                        if not parent_name:
+                            break
+                        current = self.root.nametowidget(parent_name)
+                except Exception:  # noqa: BLE001
+                    return False
+                return False
+
+            def _should_ignore_scroll(widget: object) -> bool:
+                if widget is None:
+                    return False
+                try:
+                    widget_class = widget.winfo_class()
+                except Exception:  # noqa: BLE001
+                    widget_class = ""
+                if widget_class in {"Text"}:
+                    return True
+                if self.map_backend == "tkinter" and self.map_widget is not None:
+                    if _is_descendant(widget, self.map_widget):
+                        return True
+                return False
+
+            def _on_mousewheel(event: object) -> str | None:
+                widget = getattr(event, "widget", None)
+                if _should_ignore_scroll(widget):
+                    return None
+                delta = getattr(event, "delta", 0)
+                if delta:
+                    if sys.platform == "darwin":
+                        steps = -int(delta)
+                    else:
+                        steps = -int(delta / 120)
+                        if steps == 0:
+                            steps = -1 if delta > 0 else 1
+                    if steps:
+                        canvas.yview_scroll(steps, "units")
+                return "break"
+
+            def _on_mousewheel_linux(event: object) -> str | None:
+                widget = getattr(event, "widget", None)
+                if _should_ignore_scroll(widget):
+                    return None
+                direction = -1 if getattr(event, "num", 0) == 4 else 1
+                canvas.yview_scroll(direction, "units")
+                return "break"
+
+            main.bind("<Configure>", _update_scroll_region, add="+")
+            canvas.bind("<Configure>", _sync_frame_width, add="+")
+            canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+            canvas.bind_all("<Shift-MouseWheel>", _on_mousewheel, add="+")
+            canvas.bind_all("<Button-4>", _on_mousewheel_linux, add="+")
+            canvas.bind_all("<Button-5>", _on_mousewheel_linux, add="+")
+            self.root.after_idle(lambda: canvas.configure(scrollregion=canvas.bbox("all")))
             main.columnconfigure(0, weight=1)
             main.rowconfigure(9, weight=1)
 
