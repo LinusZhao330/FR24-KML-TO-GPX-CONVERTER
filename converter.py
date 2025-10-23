@@ -7,7 +7,7 @@ import subprocess
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import click
 import requests
@@ -50,6 +50,7 @@ class NavigationPlan:
     points: List[TrackPoint]
     start_label: str = ""
     end_label: str = ""
+    via_labels: Tuple[str, ...] = tuple()
     distance_km: float = 0.0
     duration_s: float = 0.0
     warnings: Tuple[str, ...] = tuple()
@@ -492,41 +493,102 @@ def build_navigation_track(coords: List[Tuple[float, float]], duration: float, i
     return result
 
 
-def plan_navigation_route(start_query: str, dest_query: str, interval: int) -> NavigationPlan:
+def plan_navigation_route(
+    start_query: str,
+    dest_query: str,
+    waypoint_queries: Sequence[str],
+    interval: int,
+) -> NavigationPlan:
     warnings: List[str] = []
 
     start_candidates, start_warning = geocode_location(start_query)
     if start_warning:
         warnings.append(start_warning)
     if not start_candidates:
-        message = start_warning or f"Unable to find location for '{start_query}'."
+        message = start_warning or f"Unable to find location for {start_query!r}."
         return NavigationPlan(success=False, message=message, points=[])
 
     dest_candidates, dest_warning = geocode_location(dest_query)
     if dest_warning:
         warnings.append(dest_warning)
     if not dest_candidates:
-        message = dest_warning or f"Unable to find location for '{dest_query}'."
+        message = dest_warning or f"Unable to find location for {dest_query!r}."
         return NavigationPlan(success=False, message=message, points=[], start_candidates=tuple(start_candidates))
 
     start = start_candidates[0]
     dest = dest_candidates[0]
 
-    coords, distance_km, duration_s, route_error = fetch_route_osrm(start, dest)
-    if route_error:
-        warnings.append(route_error)
-        return NavigationPlan(
-            success=False,
-            message=route_error,
-            points=[],
-            start_label=start.display_name,
-            end_label=dest.display_name,
-            warnings=tuple(warnings),
-            start_candidates=tuple(start_candidates),
-            dest_candidates=tuple(dest_candidates),
-        )
+    cleaned_waypoints = [item.strip() for item in waypoint_queries if item and item.strip()]
+    via_labels: List[str] = []
+    via_locations: List[LocationCandidate] = []
+    for waypoint_query in cleaned_waypoints:
+        candidates, waypoint_warning = geocode_location(waypoint_query)
+        if waypoint_warning:
+            warnings.append(waypoint_warning)
+        if not candidates:
+            message = waypoint_warning or f"Unable to find location for waypoint {waypoint_query!r}."
+            return NavigationPlan(
+                success=False,
+                message=message,
+                points=[],
+                start_label=start.display_name,
+                end_label=dest.display_name,
+                via_labels=tuple(via_labels),
+                warnings=tuple(warnings),
+                start_candidates=tuple(start_candidates),
+                dest_candidates=tuple(dest_candidates),
+            )
+        choice = candidates[0]
+        via_locations.append(choice)
+        via_labels.append(choice.display_name)
 
-    points = build_navigation_track(coords, duration_s, interval)
+    route_points: List[Tuple[float, float]] = []
+    total_distance_km = 0.0
+    total_duration_s = 0.0
+    route_nodes = [start] + via_locations + [dest]
+
+    for idx in range(len(route_nodes) - 1):
+        segment_start = route_nodes[idx]
+        segment_end = route_nodes[idx + 1]
+        coords, segment_distance_km, segment_duration_s, route_error = fetch_route_osrm(segment_start, segment_end)
+        if route_error:
+            segment_label = f"{segment_start.display_name} -> {segment_end.display_name}"
+            message = f"Routing failed for segment {segment_label}: {route_error}"
+            warnings.append(message)
+            return NavigationPlan(
+                success=False,
+                message=message,
+                points=[],
+                start_label=start.display_name,
+                end_label=dest.display_name,
+                via_labels=tuple(via_labels),
+                warnings=tuple(warnings),
+                start_candidates=tuple(start_candidates),
+                dest_candidates=tuple(dest_candidates),
+            )
+        if not coords:
+            message = f"No route returned for segment {segment_start.display_name} -> {segment_end.display_name}."
+            warnings.append(message)
+            return NavigationPlan(
+                success=False,
+                message=message,
+                points=[],
+                start_label=start.display_name,
+                end_label=dest.display_name,
+                via_labels=tuple(via_labels),
+                warnings=tuple(warnings),
+                start_candidates=tuple(start_candidates),
+                dest_candidates=tuple(dest_candidates),
+            )
+
+        if route_points:
+            route_points.extend(coords[1:])
+        else:
+            route_points.extend(coords)
+        total_distance_km += max(segment_distance_km, 0.0)
+        total_duration_s += max(segment_duration_s, 0.0)
+
+    points = build_navigation_track(route_points, total_duration_s, interval)
     if not points:
         message = "Route was found but no points could be generated."
         return NavigationPlan(
@@ -535,15 +597,15 @@ def plan_navigation_route(start_query: str, dest_query: str, interval: int) -> N
             points=[],
             start_label=start.display_name,
             end_label=dest.display_name,
+            via_labels=tuple(via_labels),
             warnings=tuple(warnings),
             start_candidates=tuple(start_candidates),
             dest_candidates=tuple(dest_candidates),
         )
 
-    message = (
-        f"Generated route {start.display_name} → {dest.display_name}. "
-        f"Distance: {distance_km:.1f} km, points: {len(points)}."
-    )
+    path_labels = [start.display_name, *via_labels, dest.display_name]
+    path_text = " -> ".join(path_labels)
+    message = f"Generated route {path_text}. Distance: {total_distance_km:.1f} km, points: {len(points)}."
 
     return NavigationPlan(
         success=True,
@@ -551,8 +613,9 @@ def plan_navigation_route(start_query: str, dest_query: str, interval: int) -> N
         points=points,
         start_label=start.display_name,
         end_label=dest.display_name,
-        distance_km=distance_km,
-        duration_s=duration_s,
+        via_labels=tuple(via_labels),
+        distance_km=total_distance_km,
+        duration_s=total_duration_s,
         warnings=tuple(warnings),
         start_candidates=tuple(start_candidates),
         dest_candidates=tuple(dest_candidates),
@@ -605,7 +668,7 @@ def run_gui() -> bool:
             self.nav_dest_var = tk.StringVar()
             self.nav_interval_var = tk.StringVar(value="60")
             self.nav_summary_var = tk.StringVar(value="No route planned yet.")
-            self.nav_detail_var = tk.StringVar(value="Enter start and destination to plan a route.")
+            self.nav_detail_var = tk.StringVar(value="Enter start, destination, and optional waypoints to plan a route.")
             self.status_var = tk.StringVar(value="Ready - default interpolation 60 s")
             self.summary_points_var = tk.StringVar(value="Points: --")
             self.summary_duration_var = tk.StringVar(value="Duration: --")
@@ -631,15 +694,23 @@ def run_gui() -> bool:
             self.map_path = None
             self.map_markers: List[object] = []
             self.map_tab_note = None
+            self.map_tab = None
             self.map_html_path: str | None = None
             self.map_button = None
             self.fit_map_btn = None
+            self.map_holder = None
+            self.map_height_var = tk.IntVar(value=420)
+            self._map_height_guard = False
+            self.map_height_spin = None
+            self.map_height_reset_btn = None
+            self.map_height_expand_btn = None
             self.nav_plan_btn = None
             self.nav_export_btn = None
             self.nav_start_entry = None
             self.nav_dest_entry = None
             self.nav_interval_entry = None
             self.nav_swap_btn = None
+            self.nav_waypoints_text = None
 
             self._setup_style()
             self._build_ui()
@@ -725,7 +796,7 @@ def run_gui() -> bool:
                     widget_class = widget.winfo_class()
                 except Exception:  # noqa: BLE001
                     widget_class = ""
-                if widget_class in {"Text"}:
+                if widget_class in {"Text", "ScrolledText"}:
                     return True
                 if self.map_backend == "tkinter" and self.map_widget is not None:
                     if _is_descendant(widget, self.map_widget):
@@ -856,22 +927,41 @@ def run_gui() -> bool:
             self.nav_dest_entry = self.ttk.Entry(nav_group, textvariable=self.nav_dest_var, width=48)
             self.nav_dest_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(10, 0))
 
-            self.ttk.Label(nav_group, text="GPS point interval (s):").grid(row=2, column=0, sticky="w", pady=(10, 0))
-            self.nav_interval_entry = self.ttk.Entry(nav_group, textvariable=self.nav_interval_var, width=10)
-            self.nav_interval_entry.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
-            self.nav_plan_btn = self.ttk.Button(nav_group, text="Plan route", command=self.on_plan_navigation)
-            self.nav_plan_btn.grid(row=2, column=2, sticky="ew", padx=(10, 4), pady=(10, 0))
-            self.nav_export_btn = self.ttk.Button(nav_group, text="Export GPX", command=self.on_export_navigation, state="disabled")
-            self.nav_export_btn.grid(row=2, column=3, sticky="ew", pady=(10, 0))
+            self.ttk.Label(nav_group, text="Waypoints (optional, one per line):").grid(row=2, column=0, sticky="nw", pady=(10, 0))
+            self.nav_waypoints_text = self.scrolledtext.ScrolledText(
+                nav_group,
+                height=3,
+                width=48,
+                wrap="word",
+                font=("Segoe UI", 9),
+                undo=True,
+            )
+            self.nav_waypoints_text.configure(
+                borderwidth=1,
+                relief="solid",
+                highlightthickness=0,
+                background="#ffffff",
+                padx=6,
+                pady=4,
+            )
+            self.nav_waypoints_text.grid(row=2, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=(10, 0))
 
-            self.ttk.Label(nav_group, textvariable=self.nav_summary_var, style="Subtitle.TLabel").grid(row=3, column=0, columnspan=4, sticky="w", pady=(12, 0))
+            self.ttk.Label(nav_group, text="GPS point interval (s):").grid(row=3, column=0, sticky="w", pady=(10, 0))
+            self.nav_interval_entry = self.ttk.Entry(nav_group, textvariable=self.nav_interval_var, width=10)
+            self.nav_interval_entry.grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(10, 0))
+            self.nav_plan_btn = self.ttk.Button(nav_group, text="Plan route", command=self.on_plan_navigation)
+            self.nav_plan_btn.grid(row=3, column=2, sticky="ew", padx=(10, 4), pady=(10, 0))
+            self.nav_export_btn = self.ttk.Button(nav_group, text="Export GPX", command=self.on_export_navigation, state="disabled")
+            self.nav_export_btn.grid(row=3, column=3, sticky="ew", pady=(10, 0))
+
+            self.ttk.Label(nav_group, textvariable=self.nav_summary_var, style="Subtitle.TLabel").grid(row=4, column=0, columnspan=4, sticky="w", pady=(12, 0))
             self.ttk.Label(
                 nav_group,
                 textvariable=self.nav_detail_var,
                 style="InfoLabel.TLabel",
                 wraplength=520,
                 justify="left",
-            ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
             actions_frame = self.ttk.Frame(main, style="App.TFrame")
             actions_frame.grid(row=6, column=0, sticky="ew")
@@ -925,25 +1015,68 @@ def run_gui() -> bool:
             if self.map_backend == "tkinter":
                 map_tab = self.ttk.Frame(notebook, style="App.TFrame")
                 map_tab.columnconfigure(0, weight=1)
-                map_tab.rowconfigure(1, weight=1)
+                map_tab.rowconfigure(2, weight=0)
+                self.map_tab = map_tab
 
                 controls = self.ttk.Frame(map_tab, style="App.TFrame")
                 controls.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 0))
+                controls.columnconfigure(4, weight=1)
+
                 self.fit_map_btn = self.ttk.Button(
                     controls,
                     text="Fit route to view",
                     command=self.fit_map_to_route,
                     state="disabled",
                 )
-                self.fit_map_btn.pack(side="left")
+                self.fit_map_btn.grid(row=0, column=0, padx=(0, 8))
 
-                self.map_widget = self.MapViewClass(map_tab, corner_radius=0)
-                self.map_widget.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+                self.ttk.Label(controls, text="Height:", style="Subtitle.TLabel").grid(row=0, column=1, padx=(0, 4))
+                spinbox_cls = self.ttk.Spinbox if hasattr(self.ttk, "Spinbox") else self.tk.Spinbox
+                self.map_height_spin = spinbox_cls(
+                    controls,
+                    from_=240,
+                    to=960,
+                    increment=20,
+                    width=6,
+                    textvariable=self.map_height_var,
+                    command=lambda: self._apply_map_height(),
+                )
+                self.map_height_spin.grid(row=0, column=2, padx=(0, 4))
+                self.map_height_reset_btn = self.ttk.Button(
+                    controls,
+                    text="Reset",
+                    command=lambda: self._apply_map_height(420),
+                )
+                self.map_height_reset_btn.grid(row=0, column=3, padx=(0, 4))
+                self.map_height_expand_btn = self.ttk.Button(
+                    controls,
+                    text="Maximize",
+                    command=lambda: self._apply_map_height(720),
+                )
+                self.map_height_expand_btn.grid(row=0, column=4, sticky="w")
+
+                descriptor = self.ttk.Label(
+                    controls,
+                    text="Drag window taller or adjust height above for a larger map.",
+                    style="InfoLabel.TLabel",
+                )
+                descriptor.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
+                self.map_holder = self.ttk.Frame(map_tab, style="App.TFrame")
+                self.map_holder.grid(row=2, column=0, sticky="nsew", padx=4, pady=(4, 4))
+                self.map_holder.grid_propagate(False)
+                self.map_holder.columnconfigure(0, weight=1)
+                self.map_holder.rowconfigure(0, weight=1)
+
+                self.map_widget = self.MapViewClass(self.map_holder, corner_radius=0)
+                self.map_widget.place(relx=0, rely=0, relwidth=1, relheight=1)
                 try:
                     self.map_widget.set_zoom(2)
                     self.map_widget.set_position(20.0, 0.0)
                 except Exception:  # noqa: BLE001
                     pass
+                self._apply_map_height()
+                self.map_height_var.trace_add("write", self._on_map_height_change)
                 notebook.add(map_tab, text="Map Preview")
                 self.map_tab_note = None
             elif self.map_backend == "folium":
@@ -998,6 +1131,10 @@ def run_gui() -> bool:
                 self.nav_dest_entry,
                 self.nav_interval_entry,
                 self.nav_swap_btn,
+                self.nav_waypoints_text,
+                self.map_height_spin,
+                self.map_height_reset_btn,
+                self.map_height_expand_btn,
             ):
                 try:
                     widget.configure(state=state)
@@ -1093,6 +1230,54 @@ def run_gui() -> bool:
                     return zoom
             return 1
 
+        def _apply_map_height(self, height: Optional[int] = None) -> None:
+            if self.map_backend != "tkinter":
+                return
+            if height is None:
+                try:
+                    height = int(float(self.map_height_var.get()))
+                except (self.tk.TclError, ValueError, TypeError):
+                    height = 420
+            height = max(240, min(int(height), 960))
+            if not self._map_height_guard:
+                try:
+                    current_value = int(float(self.map_height_var.get()))
+                except (self.tk.TclError, ValueError, TypeError):
+                    current_value = height
+                if current_value != height:
+                    self._map_height_guard = True
+                    self.map_height_var.set(height)
+                    self._map_height_guard = False
+            if self.map_tab is not None:
+                try:
+                    self.map_tab.rowconfigure(2, weight=0, minsize=height)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.map_holder is not None:
+                self.map_holder.configure(height=height)
+                self.map_holder.grid_propagate(False)
+                self.map_holder.update_idletasks()
+            if self.map_widget is not None:
+                try:
+                    if hasattr(self.map_widget, "set_size"):
+                        width = None
+                        if self.map_holder is not None:
+                            self.map_holder.update_idletasks()
+                            measured = self.map_holder.winfo_width()
+                            if measured and measured > 1:
+                                width = measured
+                        self.map_widget.set_size(width=width, height=height)
+                    else:
+                        self.map_widget.configure(height=height)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.map_widget.update_idletasks()
+
+        def _on_map_height_change(self, *args: object) -> None:  # noqa: ARG002
+            if self.map_backend != "tkinter" or self._map_height_guard:
+                return
+            self._apply_map_height()
+
         def _update_map(self, points: List[TrackPoint]) -> None:
             if not points or self.map_backend is None:
                 return
@@ -1138,6 +1323,7 @@ def run_gui() -> bool:
                     pass
                 if self.fit_map_btn is not None:
                     self.fit_map_btn.configure(state="normal")
+                self._apply_map_height()
             elif self.map_backend == "folium":
                 self._clear_map()
                 try:
@@ -1254,11 +1440,46 @@ def run_gui() -> bool:
             self.status_label.configure(foreground=colors.get(status, "#475569"))
 
         def swap_navigation_endpoints(self) -> None:
+            if self._busy:
+                return
             start = self.nav_start_var.get()
             dest = self.nav_dest_var.get()
             self.nav_start_var.set(dest)
             self.nav_dest_var.set(start)
+            waypoints = self.get_waypoint_queries()
+            if waypoints:
+                self.set_waypoint_queries(list(reversed(waypoints)))
             self.append_log("Swapped navigation start and destination.")
+
+        def get_waypoint_queries(self) -> List[str]:
+            if self.nav_waypoints_text is None:
+                return []
+            raw = self.nav_waypoints_text.get("1.0", "end").strip()
+            if not raw:
+                return []
+            results: List[str] = []
+            for line in raw.splitlines():
+                cleaned_line = line.strip()
+                if not cleaned_line:
+                    continue
+                parts = [part.strip() for part in cleaned_line.split(";") if part.strip()]
+                if parts:
+                    results.extend(parts)
+                else:
+                    results.append(cleaned_line)
+            return results
+
+        def set_waypoint_queries(self, waypoints: Sequence[str]) -> None:
+            if self.nav_waypoints_text is None:
+                return
+            current_state = str(self.nav_waypoints_text.cget("state"))
+            if current_state == "disabled":
+                self.nav_waypoints_text.configure(state="normal")
+            self.nav_waypoints_text.delete("1.0", "end")
+            if waypoints:
+                self.nav_waypoints_text.insert("1.0", "\n".join(waypoints))
+            if current_state == "disabled":
+                self.nav_waypoints_text.configure(state="disabled")
 
         def parse_nav_interval(self) -> Optional[int]:
             value = self.nav_interval_var.get().strip()
@@ -1282,13 +1503,23 @@ def run_gui() -> bool:
                 self.messagebox.showwarning("Missing information", "Please provide both start and destination.")
                 return
 
+            waypoints = self.get_waypoint_queries()
             interval_value = self.parse_nav_interval()
             if interval_value is None:
                 self.messagebox.showwarning("Invalid interval", "GPS point interval must be a non-negative integer.")
                 self.nav_interval_var.set("60")
                 return
 
-            self.append_log(f"Planning navigation from '{start}' to '{dest}' (interval {interval_value}s).")
+            if waypoints:
+                waypoint_summary = ", ".join(waypoints[:3])
+                if len(waypoints) > 3:
+                    waypoint_summary += ", ..."
+                self.append_log(
+                    f"Planning navigation from '{start}' to '{dest}' via {len(waypoints)} waypoint(s) "
+                    f"(interval {interval_value}s). Waypoints: {waypoint_summary}"
+                )
+            else:
+                self.append_log(f"Planning navigation from '{start}' to '{dest}' (interval {interval_value}s).")
             self.nav_summary_var.set("Planning route...")
             self.nav_detail_var.set("Contacting geocoding and routing services...")
             if self.nav_export_btn is not None:
@@ -1300,13 +1531,13 @@ def run_gui() -> bool:
 
             thread = threading.Thread(
                 target=self._plan_navigation_async,
-                args=(start, dest, interval_value),
+                args=(start, dest, tuple(waypoints), interval_value),
                 daemon=True,
             )
             thread.start()
 
-        def _plan_navigation_async(self, start: str, dest: str, interval: int) -> None:
-            plan = plan_navigation_route(start, dest, interval)
+        def _plan_navigation_async(self, start: str, dest: str, waypoints: Sequence[str], interval: int) -> None:
+            plan = plan_navigation_route(start, dest, waypoints, interval)
             self.root.after(0, lambda result=plan: self._on_navigation_finished(result))
 
         def _on_navigation_finished(self, plan: NavigationPlan) -> None:
@@ -1315,10 +1546,18 @@ def run_gui() -> bool:
             if plan.success:
                 self._nav_points = plan.points
                 self._nav_plan = plan
-                summary = f"{plan.start_label} -> {plan.end_label}"
+                labels = [label for label in (plan.start_label, *plan.via_labels, plan.end_label) if label]
+                summary = " -> ".join(labels) if labels else "Navigation route ready"
                 self.nav_summary_var.set(summary)
                 duration_text = format_timedelta(timedelta(seconds=plan.duration_s)) if plan.duration_s else "N/A"
-                detail = f"Distance: {plan.distance_km:.1f} km | Duration: {duration_text} | Points: {len(plan.points)}"
+                detail_parts = [
+                    f"Distance: {plan.distance_km:.1f} km",
+                    f"Duration: {duration_text}",
+                    f"Points: {len(plan.points)}",
+                ]
+                if plan.via_labels:
+                    detail_parts.append(f"Waypoints: {len(plan.via_labels)}")
+                detail = " | ".join(detail_parts)
                 self.nav_detail_var.set(detail)
                 self._update_summary(plan.points, "Navigation plan")
                 self._update_map(plan.points)
@@ -1329,8 +1568,10 @@ def run_gui() -> bool:
             else:
                 self._nav_points = []
                 self._nav_plan = None
-                if plan.start_label or plan.end_label:
-                    summary = f"{plan.start_label or 'Start'} -> {plan.end_label or 'Destination'}"
+                labels = [label or "" for label in (plan.start_label, *plan.via_labels, plan.end_label)]
+                labels = [label for label in labels if label]
+                if labels:
+                    summary = " -> ".join(labels)
                 else:
                     summary = "Navigation planning failed."
                 self.nav_summary_var.set(summary)
@@ -1555,9 +1796,10 @@ def run_gui() -> bool:
             self.open_after_var.set(True)
             self.nav_start_var.set("")
             self.nav_dest_var.set("")
+            self.set_waypoint_queries([])
             self.nav_interval_var.set("60")
             self.nav_summary_var.set("No route planned yet.")
-            self.nav_detail_var.set("Enter start and destination to plan a route.")
+            self.nav_detail_var.set("Enter start, destination, and optional waypoints to plan a route.")
             self._last_default_output = ""
             self._last_preview_points = []
             self._last_rendered_points = []
@@ -1574,6 +1816,8 @@ def run_gui() -> bool:
                 self.open_output_btn.configure(state="disabled")
             if self.nav_export_btn is not None:
                 self.nav_export_btn.configure(state="disabled")
+            if self.map_backend == "tkinter":
+                self._apply_map_height(420)
             self.clear_log()
             self._clear_map()
             self.set_status("Reset complete. Select a KML file to begin.", "info")
